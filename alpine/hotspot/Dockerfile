@@ -1,60 +1,63 @@
-ARG BOOKWORM_TAG=20240423
+ARG ALPINE_TAG=3.19.1
 
-FROM debian:bookworm-"${BOOKWORM_TAG}" as jre-build
+FROM alpine:"${ALPINE_TAG}" AS jre-build
 
 ARG JAVA_VERSION=17.0.11_9
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 
 COPY jdk-download-url.sh /usr/bin/jdk-download-url.sh
 COPY jdk-download.sh /usr/bin/jdk-download.sh
 
-RUN apt-get update \
-  && apt-get install --no-install-recommends -y \
+RUN apk add --no-cache \
     ca-certificates \
-    curl \
     jq \
-  && rm -rf /var/lib/apt/lists/* \
-  && /usr/bin/jdk-download.sh
+    curl \
+    && rm -fr /var/cache/apk/* \
+    && /usr/bin/jdk-download.sh alpine
 
-ENV PATH=/opt/jdk-${JAVA_VERSION}/bin:$PATH
+ENV PATH="/opt/jdk-${JAVA_VERSION}/bin:${PATH}"
 
 # Generate smaller java runtime without unneeded files
 # for now we include the full module path to maintain compatibility
 # while still saving space (approx 200mb from the full distribution)
-# Arguments to jlink are specific to Java 17 jlink
-RUN jlink \
-        --add-modules ALL-MODULE-PATH \
-        --strip-java-debug-attributes \
-        --no-man-pages \
-        --no-header-files \
-        --compress=2 \
-        --output /javaruntime
+RUN if test "${TARGETPLATFORM}" != 'linux/arm/v7'; then \
+    case "$(jlink --version 2>&1)" in \
+      # jlink version 11 has less features than JDK17+
+      "11."*) set -- "--strip-debug" "--compress=2" ;; \
+      "17."*) set -- "--strip-java-debug-attributes" "--compress=2" ;; \
+      # the compression argument is different for JDK21
+      "21."*) set -- "--strip-java-debug-attributes" "--compress=zip-6" ;; \
+      *) echo "ERROR: unmanaged jlink version pattern" && exit 1 ;; \
+    esac; \
+    jlink \
+      --add-modules ALL-MODULE-PATH \
+      "$1" \
+      "$2" \
+      --no-man-pages \
+      --no-header-files \
+      --output /javaruntime; \
+  # It is acceptable to have a larger image in arm/v7 (arm 32 bits) environment.
+  # Because jlink fails with the error "jmods: Value too large for defined data type" error.
+  else cp -r "/opt/jdk-${JAVA_VERSION}" /javaruntime; \
+  fi
 
-FROM debian:bookworm-"${BOOKWORM_TAG}" AS controller
+FROM alpine:"${ALPINE_TAG}" AS controller
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    ca-certificates \
+RUN apk add --no-cache \
+    bash \
+    coreutils \
     curl \
     git \
-    gnupg \
-    gpg \
-    libfontconfig1 \
-    libfreetype6 \
-    procps \
-    ssh-client \
-    tini \
-    unzip \
-    tzdata \
-  && rm -rf /var/lib/apt/lists/*
-
-RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh -o /tmp/script.deb.sh \
-  && bash /tmp/script.deb.sh \
-  && rm -f /tmp/script.deb.sh \
-  && apt-get install -y --no-install-recommends \
     git-lfs \
-  && rm -rf /var/lib/apt/lists/* \
+    gnupg \
+    musl-locales \
+    musl-locales-lang \
+    openssh-client \
+    tini \
+    ttf-dejavu \
+    tzdata \
+    unzip \
   && git lfs install
 
 ENV LANG C.UTF-8
@@ -80,8 +83,8 @@ ENV REF $REF
 # ensure you use the same uid
 RUN mkdir -p $JENKINS_HOME \
   && chown ${uid}:${gid} $JENKINS_HOME \
-  && groupadd -g ${gid} ${group} \
-  && useradd -d "$JENKINS_HOME" -u ${uid} -g ${gid} -l -m -s /bin/bash ${user}
+  && addgroup -g ${gid} ${group} \
+  && adduser -h "$JENKINS_HOME" -u ${uid} -G ${group} -s /bin/bash -D ${user}
 
 # Jenkins home directory is a volume, so configuration and build history
 # can be persisted and survive image upgrades
@@ -136,7 +139,7 @@ COPY jenkins-support /usr/local/bin/jenkins-support
 COPY jenkins.sh /usr/local/bin/jenkins.sh
 COPY jenkins-plugin-cli.sh /bin/jenkins-plugin-cli
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/jenkins.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/jenkins.sh"]
 
 # metadata labels
 LABEL \
